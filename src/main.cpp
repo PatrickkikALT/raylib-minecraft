@@ -5,11 +5,16 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
+#include <future>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace
@@ -19,12 +24,14 @@ constexpr int WorldHeight = 128;
 constexpr int SeaLevel = 46;
 constexpr int LoadRadius = 8;
 constexpr int UnloadRadius = LoadRadius + 2;
-constexpr int ChunkGenerationsPerFrame = 1;
-constexpr int MeshesPerFrame = 1;
+constexpr int ChunkJobsPerFrame = 2;
+constexpr int MaxPendingChunkJobs = 4;
+constexpr int MeshUploadsPerFrame = 1;
 constexpr int AtlasTileSize = 1024;
 constexpr int AtlasTileCount = 4;
 constexpr float PlayerHeight = 1.75f;
 constexpr float PlayerRadius = 0.28f;
+constexpr Vector3 SunDirection = Vector3{-0.45f, 0.85f, -0.28f};
 
 enum Block : uint8_t
 {
@@ -58,6 +65,7 @@ struct Chunk
     Mesh mesh{};
     bool meshUploaded = false;
     bool dirty = true;
+    bool buildQueued = false;
     int faceCount = 0;
 };
 
@@ -74,6 +82,14 @@ struct Hit
     bool found = false;
     BlockPos block{};
     BlockPos previous{};
+};
+
+struct ChunkBuildResult
+{
+    ChunkCoord coord{};
+    std::vector<uint8_t> blocks;
+    MeshBuilder mesh;
+    int faceCount = 0;
 };
 
 struct ChunkKeyHash
@@ -120,6 +136,8 @@ struct BlockPosEq
 
 std::unordered_map<ChunkCoord, Chunk, ChunkKeyHash, ChunkKeyEq> chunks;
 std::unordered_map<BlockPos, uint8_t, BlockPosHash, BlockPosEq> edits;
+std::deque<std::future<ChunkBuildResult>> pendingChunkBuilds;
+std::unordered_set<ChunkCoord, ChunkKeyHash, ChunkKeyEq> queuedChunkBuilds;
 Material voxelMaterial{};
 Texture2D voxelAtlas{};
 
@@ -248,7 +266,7 @@ uint8_t blockAt(int x, int y, int z)
 
     const ChunkCoord cc = chunkOf(x, z);
     auto chunk = chunks.find(cc);
-    if (chunk != chunks.end() && y >= 0 && y < WorldHeight)
+    if (chunk != chunks.end() && y >= 0 && y < WorldHeight && !chunk->second.blocks.empty())
     {
         return chunk->second.blocks[blockIndex(floorMod(x, ChunkSize), y, floorMod(z, ChunkSize))];
     }
@@ -264,6 +282,11 @@ bool solid(uint8_t block)
 bool transparent(uint8_t block)
 {
     return block == Air || block == Water || block == Leaves;
+}
+
+bool lightOccluder(uint8_t block)
+{
+    return block != Air && block != Water;
 }
 
 Color blockColor(uint8_t block, int face)
@@ -346,16 +369,73 @@ void appendVertex(MeshBuilder& b, Vector3 p, Vector2 uv, Vector3 n, Color c)
     b.colors.push_back(c.a);
 }
 
-void appendFace(MeshBuilder& b, float x, float y, float z, int face, uint8_t block)
+Color litColor(Color base, float light)
+{
+    light = Clamp(light, 0.0f, 1.35f);
+    return Color{
+        static_cast<unsigned char>(std::min(255.0f, static_cast<float>(base.r) * light)),
+        static_cast<unsigned char>(std::min(255.0f, static_cast<float>(base.g) * light)),
+        static_cast<unsigned char>(std::min(255.0f, static_cast<float>(base.b) * light)),
+        base.a
+    };
+}
+
+float vertexAo(int wx, int y, int wz, Vector3 normal, Vector3 sideA, Vector3 sideB)
+{
+    const int nx = static_cast<int>(normal.x);
+    const int ny = static_cast<int>(normal.y);
+    const int nz = static_cast<int>(normal.z);
+    const int ax = static_cast<int>(sideA.x);
+    const int ay = static_cast<int>(sideA.y);
+    const int az = static_cast<int>(sideA.z);
+    const int bx = static_cast<int>(sideB.x);
+    const int by = static_cast<int>(sideB.y);
+    const int bz = static_cast<int>(sideB.z);
+
+    const bool a = lightOccluder(blockAt(wx + nx + ax, y + ny + ay, wz + nz + az));
+    const bool b = lightOccluder(blockAt(wx + nx + bx, y + ny + by, wz + nz + bz));
+    const bool corner = lightOccluder(blockAt(wx + nx + ax + bx, y + ny + ay + by, wz + nz + az + bz));
+    if (a && b) return 0.48f;
+
+    const int open = 3 - static_cast<int>(a) - static_cast<int>(b) - static_cast<int>(corner);
+    static constexpr float levels[4] = {0.58f, 0.72f, 0.88f, 1.0f};
+    return levels[open];
+}
+
+bool hasSkyAccess(int wx, int y, int wz)
+{
+    return y >= terrainHeight(wx, wz);
+}
+
+float faceLight(int wx, int y, int wz, int face, Vector3 normal)
+{
+    const Vector3 sun = Vector3Normalize(SunDirection);
+    const float sunTerm = std::max(0.0f, Vector3DotProduct(normal, sun));
+    const bool sky = hasSkyAccess(wx, y, wz) || face == 2;
+    const float skyLight = sky ? 1.0f : 0.68f;
+    const float faceShade[6] = {0.82f, 0.92f, 1.08f, 0.66f, 0.84f, 0.94f};
+    return (0.32f + skyLight * (0.52f + sunTerm * 0.18f)) * faceShade[face];
+}
+
+std::array<Vector3, 4> aoSidesForFace(int face)
+{
+    switch (face)
+    {
+    case 0: return {Vector3{0, 0, 1}, Vector3{0, 1, 0}, Vector3{0, 0, -1}, Vector3{0, -1, 0}};
+    case 1: return {Vector3{0, 0, -1}, Vector3{0, 1, 0}, Vector3{0, 0, 1}, Vector3{0, -1, 0}};
+    case 2: return {Vector3{-1, 0, 0}, Vector3{0, 0, 1}, Vector3{1, 0, 0}, Vector3{0, 0, -1}};
+    case 3: return {Vector3{-1, 0, 0}, Vector3{0, 0, -1}, Vector3{1, 0, 0}, Vector3{0, 0, 1}};
+    case 4: return {Vector3{1, 0, 0}, Vector3{0, 1, 0}, Vector3{-1, 0, 0}, Vector3{0, -1, 0}};
+    default: return {Vector3{-1, 0, 0}, Vector3{0, 1, 0}, Vector3{1, 0, 0}, Vector3{0, -1, 0}};
+    }
+}
+
+void appendFace(MeshBuilder& b, int wx, int wy, int wz, float x, float y, float z, int face, uint8_t block)
 {
     static constexpr Vector3 normals[6] = {
         {-1, 0, 0}, {1, 0, 0}, {0, 1, 0}, {0, -1, 0}, {0, 0, -1}, {0, 0, 1}
     };
-    const float shade[6] = {0.70f, 0.88f, 1.00f, 0.52f, 0.72f, 0.82f};
     Color c = blockColor(block, face);
-    c.r = static_cast<unsigned char>(static_cast<float>(c.r) * shade[face]);
-    c.g = static_cast<unsigned char>(static_cast<float>(c.g) * shade[face]);
-    c.b = static_cast<unsigned char>(static_cast<float>(c.b) * shade[face]);
 
     const std::array<Vector3, 4> quad = [&]() {
         switch (face)
@@ -371,13 +451,15 @@ void appendFace(MeshBuilder& b, float x, float y, float z, int face, uint8_t blo
 
     const int tile = atlasTileFor(block, face);
     const std::array<Vector2, 4> uv = faceUvs(tile, face);
+    const float light = faceLight(wx, wy, wz, face, normals[face]);
+    const Color lc = litColor(c, light);
 
-    appendVertex(b, quad[0], uv[0], normals[face], c);
-    appendVertex(b, quad[1], uv[1], normals[face], c);
-    appendVertex(b, quad[2], uv[2], normals[face], c);
-    appendVertex(b, quad[0], uv[0], normals[face], c);
-    appendVertex(b, quad[2], uv[2], normals[face], c);
-    appendVertex(b, quad[3], uv[3], normals[face], c);
+    appendVertex(b, quad[0], uv[0], normals[face], lc);
+    appendVertex(b, quad[1], uv[1], normals[face], lc);
+    appendVertex(b, quad[2], uv[2], normals[face], lc);
+    appendVertex(b, quad[0], uv[0], normals[face], lc);
+    appendVertex(b, quad[2], uv[2], normals[face], lc);
+    appendVertex(b, quad[3], uv[3], normals[face], lc);
 }
 
 void unloadMesh(Chunk& chunk)
@@ -401,9 +483,17 @@ void setGeneratedLocalBlock(Chunk& chunk, ChunkCoord coord, int worldX, int y, i
     if (target == Air || target == Water || block == Wood) target = block;
 }
 
-void generateChunkBlocks(ChunkCoord coord, Chunk& chunk)
+uint8_t editedGeneratedBlockAt(const std::unordered_map<BlockPos, uint8_t, BlockPosHash, BlockPosEq>& editSnapshot, int x, int y, int z)
 {
-    chunk.blocks.assign(ChunkSize * WorldHeight * ChunkSize, Air);
+    const BlockPos pos{x, y, z};
+    auto edit = editSnapshot.find(pos);
+    if (edit != editSnapshot.end()) return edit->second;
+    return generatedBlockAt(x, y, z);
+}
+
+std::vector<uint8_t> generateChunkBlockData(ChunkCoord coord, const std::unordered_map<BlockPos, uint8_t, BlockPosHash, BlockPosEq>& editSnapshot)
+{
+    std::vector<uint8_t> blocks(ChunkSize * WorldHeight * ChunkSize, Air);
     for (int z = 0; z < ChunkSize; ++z)
     {
         for (int x = 0; x < ChunkSize; ++x)
@@ -435,7 +525,7 @@ void generateChunkBlocks(ChunkCoord coord, Chunk& chunk)
                 {
                     block = Water;
                 }
-                chunk.blocks[blockIndex(x, y, z)] = block;
+                blocks[blockIndex(x, y, z)] = block;
             }
         }
     }
@@ -454,7 +544,10 @@ void generateChunkBlocks(ChunkCoord coord, Chunk& chunk)
 
             for (int y = base; y < base + 5; ++y)
             {
-                setGeneratedLocalBlock(chunk, coord, tx, y, tz, Wood);
+                if (y >= 0 && y < WorldHeight && chunkOf(tx, tz).x == coord.x && chunkOf(tx, tz).z == coord.z)
+                {
+                    blocks[blockIndex(floorMod(tx, ChunkSize), y, floorMod(tz, ChunkSize))] = Wood;
+                }
             }
 
             for (int dz = -2; dz <= 2; ++dz)
@@ -464,24 +557,49 @@ void generateChunkBlocks(ChunkCoord coord, Chunk& chunk)
                     for (int crown = -1; crown <= 2; ++crown)
                     {
                         if (std::abs(dx) + std::abs(dz) + std::max(0, crown) > 4) continue;
-                        setGeneratedLocalBlock(chunk, coord, tx - dx, base + 4 + crown, tz - dz, Leaves);
+                        const int wx = tx - dx;
+                        const int wy = base + 4 + crown;
+                        const int wz = tz - dz;
+                        if (wy < 0 || wy >= WorldHeight || chunkOf(wx, wz).x != coord.x || chunkOf(wx, wz).z != coord.z) continue;
+                        uint8_t& target = blocks[blockIndex(floorMod(wx, ChunkSize), wy, floorMod(wz, ChunkSize))];
+                        if (target == Air || target == Water) target = Leaves;
                     }
                 }
             }
         }
     }
 
-    for (const auto& edit : edits)
+    for (const auto& edit : editSnapshot)
     {
         const BlockPos& p = edit.first;
         if (chunkOf(p.x, p.z).x == coord.x && chunkOf(p.x, p.z).z == coord.z && p.y >= 0 && p.y < WorldHeight)
         {
-            chunk.blocks[blockIndex(floorMod(p.x, ChunkSize), p.y, floorMod(p.z, ChunkSize))] = edit.second;
+            blocks[blockIndex(floorMod(p.x, ChunkSize), p.y, floorMod(p.z, ChunkSize))] = edit.second;
         }
     }
+
+    return blocks;
 }
 
-void rebuildChunkMesh(ChunkCoord coord, Chunk& chunk)
+void generateChunkBlocks(ChunkCoord coord, Chunk& chunk)
+{
+    chunk.blocks = generateChunkBlockData(coord, edits);
+}
+
+uint8_t meshNeighborBlockAt(ChunkCoord coord, const std::vector<uint8_t>& blocks, const std::unordered_map<BlockPos, uint8_t, BlockPosHash, BlockPosEq>& editSnapshot, int wx, int y, int wz)
+{
+    if (y < 0 || y >= WorldHeight) return Air;
+
+    const ChunkCoord neighborCoord = chunkOf(wx, wz);
+    if (neighborCoord.x == coord.x && neighborCoord.z == coord.z)
+    {
+        return blocks[blockIndex(floorMod(wx, ChunkSize), y, floorMod(wz, ChunkSize))];
+    }
+
+    return editedGeneratedBlockAt(editSnapshot, wx, y, wz);
+}
+
+MeshBuilder buildChunkMeshData(ChunkCoord coord, const std::vector<uint8_t>& blocks, const std::unordered_map<BlockPos, uint8_t, BlockPosHash, BlockPosEq>& editSnapshot)
 {
     MeshBuilder builder;
     builder.vertices.reserve(ChunkSize * ChunkSize * 6 * 6);
@@ -499,27 +617,43 @@ void rebuildChunkMesh(ChunkCoord coord, Chunk& chunk)
         {
             for (int x = 0; x < ChunkSize; ++x)
             {
-                const uint8_t block = chunk.blocks[blockIndex(x, y, z)];
+                const uint8_t block = blocks[blockIndex(x, y, z)];
                 if (block == Air) continue;
                 const int wx = coord.x * ChunkSize + x;
                 const int wz = coord.z * ChunkSize + z;
                 for (int face = 0; face < 6; ++face)
                 {
-                    const uint8_t neighbor = blockAt(wx + dx[face], y + dy[face], wz + dz[face]);
+                    const uint8_t neighbor = meshNeighborBlockAt(coord, blocks, editSnapshot, wx + dx[face], y + dy[face], wz + dz[face]);
                     if (transparent(neighbor) && neighbor != block)
                     {
-                        appendFace(builder, static_cast<float>(x), static_cast<float>(y), static_cast<float>(z), face, block);
+                        appendFace(builder, wx, y, wz, static_cast<float>(x), static_cast<float>(y), static_cast<float>(z), face, block);
                     }
                 }
             }
         }
     }
 
+    return builder;
+}
+
+ChunkBuildResult buildChunkResult(ChunkCoord coord, std::unordered_map<BlockPos, uint8_t, BlockPosHash, BlockPosEq> editSnapshot)
+{
+    ChunkBuildResult result;
+    result.coord = coord;
+    result.blocks = generateChunkBlockData(coord, editSnapshot);
+    result.mesh = buildChunkMeshData(coord, result.blocks, editSnapshot);
+    result.faceCount = static_cast<int>(result.mesh.vertices.size() / 18);
+    return result;
+}
+
+void uploadChunkMesh(Chunk& chunk, MeshBuilder&& builder)
+{
     unloadMesh(chunk);
     chunk.faceCount = static_cast<int>(builder.vertices.size() / 18);
     if (builder.vertices.empty())
     {
         chunk.dirty = false;
+        chunk.buildQueued = false;
         return;
     }
 
@@ -536,6 +670,13 @@ void rebuildChunkMesh(ChunkCoord coord, Chunk& chunk)
     UploadMesh(&chunk.mesh, false);
     chunk.meshUploaded = true;
     chunk.dirty = false;
+    chunk.buildQueued = false;
+}
+
+void rebuildChunkMesh(ChunkCoord coord, Chunk& chunk)
+{
+    MeshBuilder builder = buildChunkMeshData(coord, chunk.blocks, edits);
+    uploadChunkMesh(chunk, std::move(builder));
 }
 
 void markDirty(int x, int z)
@@ -551,7 +692,7 @@ void setBlock(BlockPos p, uint8_t block)
     edits[p] = block;
     const ChunkCoord cc = chunkOf(p.x, p.z);
     auto chunk = chunks.find(cc);
-    if (chunk != chunks.end())
+    if (chunk != chunks.end() && !chunk->second.blocks.empty())
     {
         chunk->second.blocks[blockIndex(floorMod(p.x, ChunkSize), p.y, floorMod(p.z, ChunkSize))] = block;
     }
@@ -560,6 +701,55 @@ void setBlock(BlockPos p, uint8_t block)
     if (floorMod(p.x, ChunkSize) == ChunkSize - 1) markDirty(p.x + 1, p.z);
     if (floorMod(p.z, ChunkSize) == 0) markDirty(p.x, p.z - 1);
     if (floorMod(p.z, ChunkSize) == ChunkSize - 1) markDirty(p.x, p.z + 1);
+}
+
+void scheduleChunkBuild(ChunkCoord coord)
+{
+    if (static_cast<int>(pendingChunkBuilds.size()) >= MaxPendingChunkJobs) return;
+    if (queuedChunkBuilds.find(coord) != queuedChunkBuilds.end()) return;
+
+    auto it = chunks.find(coord);
+    if (it != chunks.end())
+    {
+        it->second.buildQueued = true;
+        it->second.dirty = false;
+    }
+    else
+    {
+        Chunk placeholder;
+        placeholder.buildQueued = true;
+        placeholder.dirty = false;
+        chunks.emplace(coord, std::move(placeholder));
+    }
+
+    queuedChunkBuilds.insert(coord);
+    auto editSnapshot = edits;
+    pendingChunkBuilds.push_back(std::async(std::launch::async, [coord, editSnapshot = std::move(editSnapshot)]() mutable {
+        return buildChunkResult(coord, std::move(editSnapshot));
+    }));
+}
+
+void collectFinishedChunkBuilds()
+{
+    int uploads = 0;
+    for (auto it = pendingChunkBuilds.begin(); it != pendingChunkBuilds.end() && uploads < MeshUploadsPerFrame;)
+    {
+        if (it->wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+        {
+            ++it;
+            continue;
+        }
+
+        ChunkBuildResult result = it->get();
+        it = pendingChunkBuilds.erase(it);
+        queuedChunkBuilds.erase(result.coord);
+
+        Chunk& chunk = chunks[result.coord];
+        chunk.blocks = std::move(result.blocks);
+        uploadChunkMesh(chunk, std::move(result.mesh));
+        chunk.faceCount = result.faceCount;
+        ++uploads;
+    }
 }
 
 void ensureChunksAround(Vector3 position, int maxNewChunks)
@@ -586,11 +776,8 @@ void ensureChunksAround(Vector3 position, int maxNewChunks)
     for (const auto& item : missing)
     {
         if (generated >= maxNewChunks) break;
-        if (chunks.find(item.second) != chunks.end()) continue;
-
-        Chunk chunk;
-        generateChunkBlocks(item.second, chunk);
-        chunks.emplace(item.second, std::move(chunk));
+        if (static_cast<int>(pendingChunkBuilds.size()) >= MaxPendingChunkJobs) break;
+        scheduleChunkBuild(item.second);
         ++generated;
     }
 
@@ -628,10 +815,10 @@ void rebuildDirtyMeshes(Vector3 position)
     for (const auto& item : dirty)
     {
         auto it = chunks.find(item.second);
-        if (it != chunks.end() && it->second.dirty)
+        if (it != chunks.end() && it->second.dirty && !it->second.buildQueued)
         {
-            rebuildChunkMesh(item.second, it->second);
-            if (++built >= MeshesPerFrame) break;
+            scheduleChunkBuild(item.second);
+            if (++built >= ChunkJobsPerFrame) break;
         }
     }
 }
@@ -766,8 +953,15 @@ int main()
     float pitch = -15.0f * DEG2RAD;
     uint8_t selectedBlock = Dirt;
 
-    ensureChunksAround(player, 64);
-    for (int i = 0; i < 24; ++i) rebuildDirtyMeshes(player);
+    for (int i = 0; i < 64; ++i)
+    {
+        ensureChunksAround(player, MaxPendingChunkJobs);
+        while (!pendingChunkBuilds.empty())
+        {
+            collectFinishedChunkBuilds();
+            if (!pendingChunkBuilds.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
 
     while (!WindowShouldClose())
     {
@@ -836,7 +1030,8 @@ int main()
             setBlock(hit.previous, selectedBlock);
         }
 
-        ensureChunksAround(player, ChunkGenerationsPerFrame);
+        collectFinishedChunkBuilds();
+        ensureChunksAround(player, ChunkJobsPerFrame);
         rebuildDirtyMeshes(player);
 
         camera.position = eye;
