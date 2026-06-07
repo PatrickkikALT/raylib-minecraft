@@ -22,13 +22,15 @@ namespace
 constexpr int ChunkSize = 16;
 constexpr int WorldHeight = 128;
 constexpr int SeaLevel = 46;
+constexpr int SnowLine = 88;
 constexpr int LoadRadius = 8;
 constexpr int UnloadRadius = LoadRadius + 2;
 constexpr int ChunkJobsPerFrame = 2;
 constexpr int MaxPendingChunkJobs = 4;
 constexpr int MeshUploadsPerFrame = 1;
 constexpr int AtlasTileSize = 1024;
-constexpr int AtlasTileCount = 4;
+constexpr int AtlasTilePadding = 4;
+constexpr int AtlasTileCount = 7;
 constexpr float PlayerHeight = 1.75f;
 constexpr float PlayerRadius = 0.28f;
 constexpr Vector3 SunDirection = Vector3{-0.45f, 0.85f, -0.28f};
@@ -82,6 +84,19 @@ struct Hit
     bool found = false;
     BlockPos block{};
     BlockPos previous{};
+};
+
+struct PigEntity
+{
+    Vector3 position{};
+    Vector3 target{};
+    Vector3 pathStep{};
+    float yaw = 0.0f;
+    float wanderTimer = 0.0f;
+    float pathTimer = 0.0f;
+    float speed = 0.0f;
+    bool hasTarget = false;
+    bool hasPathStep = false;
 };
 
 struct ChunkBuildResult
@@ -140,6 +155,11 @@ std::deque<std::future<ChunkBuildResult>> pendingChunkBuilds;
 std::unordered_set<ChunkCoord, ChunkKeyHash, ChunkKeyEq> queuedChunkBuilds;
 Material voxelMaterial{};
 Texture2D voxelAtlas{};
+Texture2D pigTexture{};
+Model pigModel{};
+std::vector<PigEntity> pigs;
+std::unordered_set<ChunkCoord, ChunkKeyHash, ChunkKeyEq> spawnedPigCells;
+uint32_t worldSeed = 0;
 
 int floorDiv(int v, int d)
 {
@@ -156,7 +176,7 @@ int floorMod(int v, int d)
 
 float hash2(int x, int z)
 {
-    uint32_t h = static_cast<uint32_t>(x) * 374761393u + static_cast<uint32_t>(z) * 668265263u;
+    uint32_t h = worldSeed ^ (static_cast<uint32_t>(x) * 374761393u + static_cast<uint32_t>(z) * 668265263u);
     h = (h ^ (h >> 13u)) * 1274126177u;
     return static_cast<float>(h ^ (h >> 16u)) / 4294967295.0f;
 }
@@ -197,18 +217,104 @@ float fbm(float x, float z)
     return sum / norm;
 }
 
+float fbmScaled(float x, float z, float baseScale, int octaves)
+{
+    float amp = 1.0f;
+    float sum = 0.0f;
+    float norm = 0.0f;
+    float scale = baseScale;
+    for (int i = 0; i < octaves; ++i)
+    {
+        sum += valueNoise(x, z, scale) * amp;
+        norm += amp;
+        amp *= 0.5f;
+        scale *= 0.5f;
+    }
+    return sum / norm;
+}
+
+float smoothStep(float edge0, float edge1, float x)
+{
+    const float t = Clamp((x - edge0) / (edge1 - edge0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+float ridgeNoise(float x, float z, float scale)
+{
+    const float n = valueNoise(x, z, scale) * 2.0f - 1.0f;
+    const float ridge = 1.0f - std::abs(n);
+    return ridge * ridge;
+}
+
 int terrainHeight(int x, int z)
 {
-    const float broad = fbm(static_cast<float>(x), static_cast<float>(z));
-    const float ridges = std::abs(fbm(static_cast<float>(x) + 260.0f, static_cast<float>(z) - 120.0f) * 2.0f - 1.0f);
-    const int h = static_cast<int>(34.0f + broad * 45.0f + ridges * ridges * 18.0f);
-    return std::clamp(h, 8, WorldHeight - 8);
+    const float fx = static_cast<float>(x);
+    const float fz = static_cast<float>(z);
+    const float warpX = (fbmScaled(fx + 900.0f, fz - 350.0f, 260.0f, 3) - 0.5f) * 44.0f;
+    const float warpZ = (fbmScaled(fx - 520.0f, fz + 740.0f, 260.0f, 3) - 0.5f) * 44.0f;
+    const float wx = fx + warpX;
+    const float wz = fz + warpZ;
+
+    const float continent = fbmScaled(wx, wz, 540.0f, 4);
+    const float mountainMask = smoothStep(0.44f, 0.72f, continent);
+    const float mountainMass = smoothStep(0.42f, 0.82f, fbmScaled(wx - 700.0f, wz + 250.0f, 310.0f, 4));
+    const float foothills = fbmScaled(wx + 180.0f, wz - 440.0f, 165.0f, 4);
+    const float ridgeA = ridgeNoise(wx + 40.0f, wz - 120.0f, 150.0f);
+    const float ridgeB = ridgeNoise(wx - 310.0f, wz + 270.0f, 82.0f) * 0.55f;
+    const float alpine = std::pow(std::max(ridgeA, ridgeB), 0.82f);
+    const float erosion = fbmScaled(wx + 1200.0f, wz + 800.0f, 32.0f, 3) - 0.5f;
+
+    const float lowlands = 31.0f + continent * 31.0f + foothills * 13.0f;
+    const float mountainLift = mountainMask * (mountainMass * 46.0f + foothills * 22.0f);
+    const float peaks = mountainMask * mountainMass * alpine * 34.0f;
+    const int h = static_cast<int>(lowlands + mountainLift + peaks + erosion * (4.0f + mountainMask * 8.0f));
+    return std::clamp(h, 8, WorldHeight - 5);
+}
+
+int terrainSlope(int x, int z)
+{
+    const int h = terrainHeight(x, z);
+    const int dx = std::max(std::abs(h - terrainHeight(x - 1, z)), std::abs(h - terrainHeight(x + 1, z)));
+    const int dz = std::max(std::abs(h - terrainHeight(x, z - 1)), std::abs(h - terrainHeight(x, z + 1)));
+    return std::max(dx, dz);
+}
+
+uint8_t surfaceBlockFor(int x, int z, int h, int slope)
+{
+    if (h <= SeaLevel + 2) return Sand;
+
+    const float snowNoise = valueNoise(static_cast<float>(x) + 37.0f, static_cast<float>(z) - 91.0f, 38.0f);
+    const int localSnowLine = SnowLine + static_cast<int>((snowNoise - 0.5f) * 9.0f);
+    if (h >= localSnowLine) return Snow;
+
+    if (slope >= 5 || (h > 74 && slope >= 3) || h > SnowLine - 5) return Stone;
+    return Grass;
+}
+
+uint8_t columnBlockAt(int x, int y, int z, int h, int slope)
+{
+    if (y > h)
+    {
+        return y <= SeaLevel ? Water : Air;
+    }
+
+    const uint8_t surface = surfaceBlockFor(x, z, h, slope);
+    if (y == h) return surface;
+
+    const int depth = h - y;
+    if (surface == Sand && depth < 5) return Sand;
+    if (surface == Snow && depth < 2) return Snow;
+    if (surface == Grass && depth < 4) return Dirt;
+    if (surface == Stone && depth < 2 && h < SnowLine - 2 && slope < 7) return Dirt;
+    return Stone;
 }
 
 bool treeAt(int x, int z)
 {
     if ((x & 3) != 0 || (z & 3) != 0) return false;
-    return hash2(floorDiv(x, 4), floorDiv(z, 4)) > 0.965f;
+    const int h = terrainHeight(x, z);
+    if (h <= SeaLevel + 3 || h >= SnowLine - 4 || terrainSlope(x, z) > 3) return false;
+    return hash2(floorDiv(x, 4), floorDiv(z, 4)) > 0.968f;
 }
 
 uint8_t generatedBlockAt(int x, int y, int z)
@@ -216,19 +322,10 @@ uint8_t generatedBlockAt(int x, int y, int z)
     if (y < 0 || y >= WorldHeight) return Air;
 
     const int h = terrainHeight(x, z);
-    if (y <= h)
-    {
-        if (y == h)
-        {
-            if (h <= SeaLevel + 1) return Sand;
-            if (h > 82) return Snow;
-            return Grass;
-        }
-        if (y > h - 4) return h <= SeaLevel + 1 ? Sand : Dirt;
-        return Stone;
-    }
-
-    if (y <= SeaLevel) return Water;
+    const int slope = terrainSlope(x, z);
+    const uint8_t terrain = columnBlockAt(x, y, z, h, slope);
+    if (terrain != Air && terrain != Water) return terrain;
+    if (terrain == Water) return Water;
 
     for (int dz = -2; dz <= 2; ++dz)
     {
@@ -238,7 +335,7 @@ uint8_t generatedBlockAt(int x, int y, int z)
             const int tz = z + dz;
             if (!treeAt(tx, tz)) continue;
             const int base = terrainHeight(tx, tz) + 1;
-            if (base <= SeaLevel + 2 || base > 84) continue;
+            if (base <= SeaLevel + 2 || base > SnowLine - 3) continue;
             if (x == tx && z == tz && y >= base && y < base + 5) return Wood;
             const int crown = y - (base + 4);
             if (crown >= -1 && crown <= 2 && std::abs(dx) + std::abs(dz) + std::max(0, crown) <= 4) return Leaves;
@@ -314,9 +411,9 @@ int atlasTileFor(uint8_t block, int face)
         if (face == 3) return 1; // dirt.png
         return 0;                // grassblock.png
     case Dirt: return 1;
-    case Stone: return 3;        // bedrock.png doubles as the rocky texture in this small set
-    case Sand: return 1;
-    case Snow: return 2;
+    case Stone: return 4;
+    case Sand: return 3;
+    case Snow: return 5;
     case Water: return 0;
     case Wood: return 1;
     case Leaves: return 2;
@@ -326,11 +423,16 @@ int atlasTileFor(uint8_t block, int face)
 
 Vector2 atlasUv(int tile, Vector2 localUv)
 {
-    const float tileWidth = 1.0f / static_cast<float>(AtlasTileCount);
-    const float inset = 0.5f / static_cast<float>(AtlasTileSize * AtlasTileCount);
+    const float stride = static_cast<float>(AtlasTileSize + AtlasTilePadding * 2);
+    const float atlasWidth = stride * static_cast<float>(AtlasTileCount);
+    const float atlasHeight = stride;
+    const float u0 = (static_cast<float>(tile) * stride + static_cast<float>(AtlasTilePadding) + 0.5f) / atlasWidth;
+    const float v0 = (static_cast<float>(AtlasTilePadding) + 0.5f) / atlasHeight;
+    const float u1 = (static_cast<float>(tile) * stride + static_cast<float>(AtlasTilePadding + AtlasTileSize) - 0.5f) / atlasWidth;
+    const float v1 = (static_cast<float>(AtlasTilePadding + AtlasTileSize) - 0.5f) / atlasHeight;
     return {
-        tile * tileWidth + localUv.x * tileWidth + (localUv.x == 0.0f ? inset : -inset),
-        localUv.y + (localUv.y == 0.0f ? inset : -inset)
+        Lerp(u0, u1, localUv.x),
+        Lerp(v0, v1, localUv.y)
     };
 }
 
@@ -501,31 +603,10 @@ std::vector<uint8_t> generateChunkBlockData(ChunkCoord coord, const std::unorder
             const int wx = coord.x * ChunkSize + x;
             const int wz = coord.z * ChunkSize + z;
             const int h = terrainHeight(wx, wz);
+            const int slope = terrainSlope(wx, wz);
             for (int y = 0; y < WorldHeight; ++y)
             {
-                uint8_t block = Air;
-                if (y <= h)
-                {
-                    if (y == h)
-                    {
-                        if (h <= SeaLevel + 1) block = Sand;
-                        else if (h > 82) block = Snow;
-                        else block = Grass;
-                    }
-                    else if (y > h - 4)
-                    {
-                        block = h <= SeaLevel + 1 ? Sand : Dirt;
-                    }
-                    else
-                    {
-                        block = Stone;
-                    }
-                }
-                else if (y <= SeaLevel)
-                {
-                    block = Water;
-                }
-                blocks[blockIndex(x, y, z)] = block;
+                blocks[blockIndex(x, y, z)] = columnBlockAt(wx, y, wz, h, slope);
             }
         }
     }
@@ -540,7 +621,7 @@ std::vector<uint8_t> generateChunkBlockData(ChunkCoord coord, const std::unorder
         {
             if (!treeAt(tx, tz)) continue;
             const int base = terrainHeight(tx, tz) + 1;
-            if (base <= SeaLevel + 2 || base > 84) continue;
+            if (base <= SeaLevel + 2 || base > SnowLine - 3) continue;
 
             for (int y = base; y < base + 5; ++y)
             {
@@ -900,6 +981,7 @@ void drawAtlasTile(Image& atlas, const char* fileName, int tile)
 {
     Image source = LoadImage(fileName);
     if (source.data == nullptr) return;
+    const int stride = AtlasTileSize + AtlasTilePadding * 2;
 
     const Rectangle src{
         0.0f,
@@ -907,23 +989,34 @@ void drawAtlasTile(Image& atlas, const char* fileName, int tile)
         static_cast<float>(source.width),
         static_cast<float>(source.height)
     };
-    const Rectangle dst{
-        static_cast<float>(tile * AtlasTileSize),
+    const Rectangle paddedDst{
+        static_cast<float>(tile * stride),
         0.0f,
+        static_cast<float>(stride),
+        static_cast<float>(stride)
+    };
+    const Rectangle dst{
+        static_cast<float>(tile * stride + AtlasTilePadding),
+        static_cast<float>(AtlasTilePadding),
         static_cast<float>(AtlasTileSize),
         static_cast<float>(AtlasTileSize)
     };
+    ImageDraw(&atlas, source, src, paddedDst, WHITE);
     ImageDraw(&atlas, source, src, dst, WHITE);
     UnloadImage(source);
 }
 
 Texture2D loadVoxelAtlas()
 {
-    Image atlas = GenImageColor(AtlasTileSize * AtlasTileCount, AtlasTileSize, MAGENTA);
+    const int stride = AtlasTileSize + AtlasTilePadding * 2;
+    Image atlas = GenImageColor(stride * AtlasTileCount, stride, BLACK);
     drawAtlasTile(atlas, "grassblock.png", 0);
     drawAtlasTile(atlas, "dirt.png", 1);
     drawAtlasTile(atlas, "grass.png", 2);
-    drawAtlasTile(atlas, "bedrock.png", 3);
+    drawAtlasTile(atlas, "sand.png", 3);
+    drawAtlasTile(atlas, "stone.png", 4);
+    drawAtlasTile(atlas, "snow.png", 5);
+    drawAtlasTile(atlas, "bedrock.png", 6);
 
     Texture2D texture = LoadTextureFromImage(atlas);
     SetTextureFilter(texture, TEXTURE_FILTER_POINT);
@@ -932,12 +1025,364 @@ Texture2D loadVoxelAtlas()
     return texture;
 }
 
+Vector2 skinUv(float x, float y)
+{
+    return {x / 640.0f, y / 320.0f};
+}
+
+void appendPigQuad(MeshBuilder& b, Vector3 a, Vector3 c, Vector3 d, Vector3 e, Vector3 normal, Rectangle skin)
+{
+    const Vector2 uv0 = skinUv(skin.x, skin.y + skin.height);
+    const Vector2 uv1 = skinUv(skin.x, skin.y);
+    const Vector2 uv2 = skinUv(skin.x + skin.width, skin.y);
+    const Vector2 uv3 = skinUv(skin.x + skin.width, skin.y + skin.height);
+    appendVertex(b, a, uv0, normal, WHITE);
+    appendVertex(b, c, uv1, normal, WHITE);
+    appendVertex(b, d, uv2, normal, WHITE);
+    appendVertex(b, a, uv0, normal, WHITE);
+    appendVertex(b, d, uv2, normal, WHITE);
+    appendVertex(b, e, uv3, normal, WHITE);
+}
+
+struct BoxSkin
+{
+    Rectangle left{};
+    Rectangle right{};
+    Rectangle top{};
+    Rectangle bottom{};
+    Rectangle front{};
+    Rectangle back{};
+};
+
+BoxSkin minecraftBoxSkin(float texX, float texY, float width, float height, float depth)
+{
+    constexpr float Scale = 10.0f;
+    texX *= Scale;
+    texY *= Scale;
+    width *= Scale;
+    height *= Scale;
+    depth *= Scale;
+    return {
+        {texX + depth + width, texY + depth, depth, height},
+        {texX, texY + depth, depth, height},
+        {texX + depth, texY, width, depth},
+        {texX + depth + width, texY, width, depth},
+        {texX + depth, texY + depth, width, height},
+        {texX + depth + width + depth, texY + depth, width, height}
+    };
+}
+
+void appendPigBox(MeshBuilder& b, Vector3 center, Vector3 size, BoxSkin skin)
+{
+    const float x0 = center.x - size.x * 0.5f;
+    const float x1 = center.x + size.x * 0.5f;
+    const float y0 = center.y - size.y * 0.5f;
+    const float y1 = center.y + size.y * 0.5f;
+    const float z0 = center.z - size.z * 0.5f;
+    const float z1 = center.z + size.z * 0.5f;
+
+    appendPigQuad(b, {x0, y0, z1}, {x0, y1, z1}, {x0, y1, z0}, {x0, y0, z0}, {-1, 0, 0}, skin.left);
+    appendPigQuad(b, {x1, y0, z0}, {x1, y1, z0}, {x1, y1, z1}, {x1, y0, z1}, {1, 0, 0}, skin.right);
+    appendPigQuad(b, {x0, y1, z0}, {x0, y1, z1}, {x1, y1, z1}, {x1, y1, z0}, {0, 1, 0}, skin.top);
+    appendPigQuad(b, {x0, y0, z1}, {x0, y0, z0}, {x1, y0, z0}, {x1, y0, z1}, {0, -1, 0}, skin.bottom);
+    appendPigQuad(b, {x1, y0, z0}, {x0, y0, z0}, {x0, y1, z0}, {x1, y1, z0}, {0, 0, -1}, skin.back);
+    appendPigQuad(b, {x0, y0, z1}, {x1, y0, z1}, {x1, y1, z1}, {x0, y1, z1}, {0, 0, 1}, skin.front);
+}
+
+Mesh buildPigMesh()
+{
+    MeshBuilder builder;
+    builder.vertices.reserve(36 * 6);
+    builder.texcoords.reserve(24 * 6);
+    builder.normals.reserve(36 * 6);
+    builder.colors.reserve(36 * 4 * 6);
+
+    const BoxSkin bodySkin = minecraftBoxSkin(28, 8, 10, 8, 16);
+    const BoxSkin headSkin = minecraftBoxSkin(0, 0, 8, 8, 8);
+    const BoxSkin legSkin = minecraftBoxSkin(0, 16, 4, 6, 4);
+
+    appendPigBox(builder, {0.0f, 0.72f, 0.0f}, {1.18f, 0.56f, 0.58f}, bodySkin);
+    appendPigBox(builder, {0.0f, 0.86f, 0.54f}, {0.54f, 0.50f, 0.48f}, headSkin);
+    appendPigBox(builder, {-0.38f, 0.28f, 0.19f}, {0.18f, 0.56f, 0.18f}, legSkin);
+    appendPigBox(builder, {0.38f, 0.28f, 0.19f}, {0.18f, 0.56f, 0.18f}, legSkin);
+    appendPigBox(builder, {-0.38f, 0.28f, -0.19f}, {0.18f, 0.56f, 0.18f}, legSkin);
+    appendPigBox(builder, {0.38f, 0.28f, -0.19f}, {0.18f, 0.56f, 0.18f}, legSkin);
+
+    Mesh mesh{};
+    mesh.vertexCount = static_cast<int>(builder.vertices.size() / 3);
+    mesh.triangleCount = mesh.vertexCount / 3;
+    mesh.vertices = static_cast<float*>(MemAlloc(builder.vertices.size() * sizeof(float)));
+    mesh.texcoords = static_cast<float*>(MemAlloc(builder.texcoords.size() * sizeof(float)));
+    mesh.normals = static_cast<float*>(MemAlloc(builder.normals.size() * sizeof(float)));
+    mesh.colors = static_cast<unsigned char*>(MemAlloc(builder.colors.size() * sizeof(unsigned char)));
+    std::copy(builder.vertices.begin(), builder.vertices.end(), mesh.vertices);
+    std::copy(builder.texcoords.begin(), builder.texcoords.end(), mesh.texcoords);
+    std::copy(builder.normals.begin(), builder.normals.end(), mesh.normals);
+    std::copy(builder.colors.begin(), builder.colors.end(), mesh.colors);
+    UploadMesh(&mesh, false);
+    return mesh;
+}
+
+bool pigGroundAt(float x, float z, float& y)
+{
+    const int wx = static_cast<int>(std::floor(x));
+    const int wz = static_cast<int>(std::floor(z));
+    const int terrainY = terrainHeight(wx, wz);
+    const int top = std::min(WorldHeight - 3, terrainY + 4);
+    const int bottom = std::max(1, terrainY - 10);
+    for (int gy = top; gy >= bottom; --gy)
+    {
+        if (!solid(blockAt(wx, gy, wz))) continue;
+        if (blockAt(wx, gy + 1, wz) != Air || blockAt(wx, gy + 2, wz) != Air) continue;
+        y = static_cast<float>(gy) + 1.02f;
+        return true;
+    }
+    return false;
+}
+
+bool pigCellWalkable(int x, int z, int& groundY)
+{
+    float y = 0.0f;
+    if (!pigGroundAt(static_cast<float>(x) + 0.5f, static_cast<float>(z) + 0.5f, y)) return false;
+    groundY = static_cast<int>(std::floor(y));
+    return true;
+}
+
+bool pigCanMoveBetween(int fromX, int fromZ, int toX, int toZ)
+{
+    int fromY = 0;
+    int toY = 0;
+    if (!pigCellWalkable(fromX, fromZ, fromY) || !pigCellWalkable(toX, toZ, toY)) return false;
+    return std::abs(toY - fromY) <= 1;
+}
+
+bool findPigPathStep(Vector3 from, Vector3 desired, Vector3& next)
+{
+    constexpr int Radius = 4;
+    constexpr int Size = Radius * 2 + 1;
+    constexpr int Count = Size * Size;
+    const int startX = static_cast<int>(std::floor(from.x));
+    const int startZ = static_cast<int>(std::floor(from.z));
+    const int goalX = static_cast<int>(std::floor(desired.x));
+    const int goalZ = static_cast<int>(std::floor(desired.z));
+    auto indexOf = [](int lx, int lz) { return lz * Size + lx; };
+
+    std::array<int, Count> parent{};
+    std::array<int, Count> queue{};
+    parent.fill(-2);
+    int head = 0;
+    int tail = 0;
+    const int start = indexOf(Radius, Radius);
+    parent[start] = -1;
+    queue[tail++] = start;
+
+    int best = start;
+    int bestScore = std::abs(startX - goalX) + std::abs(startZ - goalZ);
+    static constexpr int ox[4] = {1, -1, 0, 0};
+    static constexpr int oz[4] = {0, 0, 1, -1};
+
+    while (head < tail)
+    {
+        const int current = queue[head++];
+        const int lx = current % Size;
+        const int lz = current / Size;
+        const int wx = startX + lx - Radius;
+        const int wz = startZ + lz - Radius;
+        const int score = std::abs(wx - goalX) + std::abs(wz - goalZ);
+        if (score < bestScore)
+        {
+            bestScore = score;
+            best = current;
+            if (score == 0) break;
+        }
+
+        for (int i = 0; i < 4; ++i)
+        {
+            const int nlx = lx + ox[i];
+            const int nlz = lz + oz[i];
+            if (nlx < 0 || nlx >= Size || nlz < 0 || nlz >= Size) continue;
+            const int ni = indexOf(nlx, nlz);
+            if (parent[ni] != -2) continue;
+            if (!pigCanMoveBetween(wx, wz, startX + nlx - Radius, startZ + nlz - Radius)) continue;
+            parent[ni] = current;
+            queue[tail++] = ni;
+        }
+    }
+
+    if (best == start) return false;
+    int step = best;
+    while (parent[step] != start && parent[step] != -1) step = parent[step];
+
+    const int sx = startX + (step % Size) - Radius;
+    const int sz = startZ + (step / Size) - Radius;
+    float y = 0.0f;
+    if (!pigGroundAt(static_cast<float>(sx) + 0.5f, static_cast<float>(sz) + 0.5f, y)) return false;
+    next = {static_cast<float>(sx) + 0.5f, y, static_cast<float>(sz) + 0.5f};
+    return true;
+}
+
+void spawnPigsAround(Vector3 player)
+{
+    constexpr int EntityCellSize = 32;
+    constexpr int EntityCellRadius = 3;
+    constexpr int MaxPigs = 28;
+    const int centerX = floorDiv(static_cast<int>(std::floor(player.x)), EntityCellSize);
+    const int centerZ = floorDiv(static_cast<int>(std::floor(player.z)), EntityCellSize);
+
+    pigs.erase(std::remove_if(pigs.begin(), pigs.end(), [&](const PigEntity& pig) {
+        return Vector3DistanceSqr(pig.position, player) > 190.0f * 190.0f;
+    }), pigs.end());
+
+    for (int dz = -EntityCellRadius; dz <= EntityCellRadius && static_cast<int>(pigs.size()) < MaxPigs; ++dz)
+    {
+        for (int dx = -EntityCellRadius; dx <= EntityCellRadius && static_cast<int>(pigs.size()) < MaxPigs; ++dx)
+        {
+            const ChunkCoord cell{centerX + dx, centerZ + dz};
+            if (spawnedPigCells.find(cell) != spawnedPigCells.end()) continue;
+            spawnedPigCells.insert(cell);
+
+            if (hash2(cell.x, cell.z) < 0.78f) continue;
+            const int count = 1 + static_cast<int>(hash2(cell.x + 19, cell.z - 7) * 2.0f);
+            for (int i = 0; i < count && static_cast<int>(pigs.size()) < MaxPigs; ++i)
+            {
+                const float px = static_cast<float>(cell.x * EntityCellSize) + 4.0f + hash2(cell.x * 11 + i, cell.z * 17) * 24.0f;
+                const float pz = static_cast<float>(cell.z * EntityCellSize) + 4.0f + hash2(cell.x * 23, cell.z * 13 + i) * 24.0f;
+                float py = 0.0f;
+                if (!pigGroundAt(px, pz, py)) continue;
+
+                PigEntity pig;
+                pig.position = {px, py, pz};
+                pig.yaw = hash2(cell.x + i * 5, cell.z - i * 9) * PI * 2.0f;
+                pig.wanderTimer = 0.5f + hash2(cell.x - i, cell.z + i) * 2.5f;
+                pig.speed = 0.5f;
+                pigs.push_back(pig);
+            }
+        }
+    }
+}
+
+void updatePigs(float dt)
+{
+    for (PigEntity& pig : pigs)
+    {
+        pig.wanderTimer -= dt;
+        if (pig.wanderTimer <= 0.0f)
+        {
+            pig.wanderTimer = 1.2f + hash2(static_cast<int>(pig.position.x * 7.0f), static_cast<int>(pig.position.z * 5.0f)) * 2.0f;
+            const float angle = hash2(static_cast<int>(pig.position.x * 13.0f), static_cast<int>(pig.position.z * 19.0f)) * PI * 2.0f;
+            const float distance = 3.0f + hash2(static_cast<int>(pig.position.x * 3.0f), static_cast<int>(pig.position.z * 3.0f)) * 7.0f;
+            pig.target = {
+                pig.position.x + std::sin(angle) * distance,
+                pig.position.y,
+                pig.position.z + std::cos(angle) * distance
+            };
+            pig.hasTarget = true;
+            pig.hasPathStep = false;
+            pig.pathTimer = 0.0f;
+            pig.speed = 0.9f;
+        }
+
+        if (!pig.hasTarget) continue;
+
+        pig.pathTimer -= dt;
+        if (!pig.hasPathStep || pig.pathTimer <= 0.0f)
+        {
+            if (!findPigPathStep(pig.position, pig.target, pig.pathStep))
+            {
+                pig.hasTarget = false;
+                pig.hasPathStep = false;
+                pig.speed = 0.0f;
+                continue;
+            }
+            pig.hasPathStep = true;
+            pig.pathTimer = 0.35f;
+        }
+
+        Vector3 toStep = Vector3Subtract(pig.pathStep, pig.position);
+        toStep.y = 0.0f;
+        const float distanceToStep = Vector3Length(toStep);
+        if (distanceToStep < 0.10f)
+        {
+            pig.position = pig.pathStep;
+            pig.hasPathStep = false;
+            if (Vector3DistanceSqr(pig.position, pig.target) < 1.4f)
+            {
+                pig.hasTarget = false;
+                pig.hasPathStep = false;
+                pig.speed = 0.0f;
+            }
+        }
+        else
+        {
+            const Vector3 dir = Vector3Scale(toStep, 1.0f / distanceToStep);
+            const float move = std::min(distanceToStep, pig.speed * dt);
+            const Vector3 next = Vector3Add(pig.position, Vector3Scale(dir, move));
+            pig.position = {next.x, Lerp(pig.position.y, pig.pathStep.y, std::min(1.0f, dt * 10.0f)), next.z};
+            pig.yaw = std::atan2(dir.x, dir.z);
+        }
+    }
+}
+
+void addPigAt(Vector3 position, float yaw)
+{
+    PigEntity pig;
+    pig.position = position;
+    pig.yaw = yaw;
+    pig.wanderTimer = 0.8f;
+    pig.pathTimer = 0.0f;
+    pig.speed = 0.0f;
+    pig.hasTarget = false;
+    pig.hasPathStep = false;
+    pigs.push_back(pig);
+}
+
+void summonPig(Vector3 player, Vector3 forward)
+{
+    Vector3 flatForward{forward.x, 0.0f, forward.z};
+    if (Vector3LengthSqr(flatForward) < 0.01f) flatForward = {0.0f, 0.0f, 1.0f};
+    flatForward = Vector3Normalize(flatForward);
+
+    for (float distance = 2.0f; distance <= 9.0f; distance += 1.0f)
+    {
+        const float x = player.x + flatForward.x * distance;
+        const float z = player.z + flatForward.z * distance;
+        float y = 0.0f;
+        if (!pigGroundAt(x, z, y)) continue;
+        addPigAt({x, y, z}, std::atan2(-flatForward.x, -flatForward.z));
+        return;
+    }
+
+    const int x = static_cast<int>(std::floor(player.x + flatForward.x * 3.0f));
+    const int z = static_cast<int>(std::floor(player.z + flatForward.z * 3.0f));
+    addPigAt({static_cast<float>(x) + 0.5f, static_cast<float>(terrainHeight(x, z)) + 0.02f, static_cast<float>(z) + 0.5f}, 0.0f);
+}
+
+void drawPigs(Vector3 player)
+{
+    constexpr float PigModelScale = 3.2f;
+    constexpr float PigFootOffset = 0.2032f * PigModelScale;
+    for (const PigEntity& pig : pigs)
+    {
+        if (Vector3DistanceSqr(pig.position, player) > 130.0f * 130.0f) continue;
+        DrawModelEx(
+            pigModel,
+            {pig.position.x, pig.position.y + PigFootOffset, pig.position.z},
+            {0.0f, 1.0f, 0.0f},
+            pig.yaw * RAD2DEG,
+            {PigModelScale, PigModelScale, PigModelScale},
+            WHITE
+        );
+    }
+}
+
 } // namespace
 
 int main()
 {
     SetConfigFlags(FLAG_WINDOW_RESIZABLE | FLAG_MSAA_4X_HINT);
     InitWindow(1280, 720, "Raycraft - chunked voxel terrain");
+    //SetTargetFPS(600);
+    worldSeed = static_cast<uint32_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
     DisableCursor();
     SearchAndSetResourceDir("resources");
 
@@ -945,6 +1390,14 @@ int main()
     voxelMaterial = LoadMaterialDefault();
     voxelMaterial.maps[MATERIAL_MAP_DIFFUSE].color = WHITE;
     SetMaterialTexture(&voxelMaterial, MATERIAL_MAP_DIFFUSE, voxelAtlas);
+    pigModel = LoadModel("pig.obj");
+    pigTexture = LoadTexture("pig.png");
+    SetTextureFilter(pigTexture, TEXTURE_FILTER_POINT);
+    for (int i = 0; i < pigModel.materialCount; ++i)
+    {
+        SetMaterialTexture(&pigModel.materials[i], MATERIAL_MAP_DIFFUSE, pigTexture);
+        pigModel.materials[i].maps[MATERIAL_MAP_DIFFUSE].color = WHITE;
+    }
 
     Camera3D camera{};
     Vector3 player{8.0f, static_cast<float>(terrainHeight(8, 8) + 3), 8.0f};
@@ -1024,7 +1477,13 @@ int main()
 
         const Vector3 eye = Vector3Add(player, Vector3{0.0f, 1.62f, 0.0f});
         const Hit hit = raycastBlocks(eye, forward, 6.0f);
-        if (hit.found && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) setBlock(hit.block, Air);
+        const Rectangle summonButton{static_cast<float>(GetScreenWidth() - 164), 16.0f, 148.0f, 34.0f};
+        const bool summonHovered = !IsCursorHidden() && CheckCollisionPointRec(GetMousePosition(), summonButton);
+        if (IsKeyPressed(KEY_P) || (summonHovered && IsMouseButtonPressed(MOUSE_BUTTON_LEFT)))
+        {
+            summonPig(player, forward);
+        }
+        if (hit.found && IsMouseButtonPressed(MOUSE_BUTTON_LEFT) && !summonHovered) setBlock(hit.block, Air);
         if (hit.found && IsMouseButtonPressed(MOUSE_BUTTON_RIGHT) && !boxHitsWorld(Vector3{hit.previous.x + 0.5f, static_cast<float>(hit.previous.y), hit.previous.z + 0.5f}))
         {
             setBlock(hit.previous, selectedBlock);
@@ -1033,6 +1492,8 @@ int main()
         collectFinishedChunkBuilds();
         ensureChunksAround(player, ChunkJobsPerFrame);
         rebuildDirtyMeshes(player);
+        spawnPigsAround(player);
+        updatePigs(dt);
 
         camera.position = eye;
         camera.target = Vector3Add(eye, forward);
@@ -1057,17 +1518,24 @@ int main()
         {
             DrawCubeWires(Vector3{hit.block.x + 0.5f, hit.block.y + 0.5f, hit.block.z + 0.5f}, 1.01f, 1.01f, 1.01f, BLACK);
         }
+        drawPigs(player);
         EndMode3D();
 
-        DrawRectangle(12, 12, 340, 94, Fade(BLACK, 0.32f));
-        DrawText(TextFormat("FPS %d | chunks %d | edits %d", GetFPS(), static_cast<int>(chunks.size()), static_cast<int>(edits.size())), 24, 24, 20, WHITE);
-        DrawText("WASD move  Space jump  Ctrl fly  LMB/RMB mine/place", 24, 50, 16, RAYWHITE);
+        DrawRectangle(12, 12, 390, 116, Fade(BLACK, 0.32f));
+        DrawText(TextFormat("FPS %d | chunks %d | pigs %d | edits %d", GetFPS(), static_cast<int>(chunks.size()), static_cast<int>(pigs.size()), static_cast<int>(edits.size())), 24, 24, 20, WHITE);
+        DrawText("WASD move  Space jump  Ctrl fly  LMB/RMB mine/place  P pig", 24, 50, 16, RAYWHITE);
         DrawText(TextFormat("Block %d | position %.1f %.1f %.1f", selectedBlock, player.x, player.y, player.z), 24, 72, 16, RAYWHITE);
+        DrawText(TextFormat("Seed %u", worldSeed), 24, 94, 16, RAYWHITE);
+        DrawRectangleRec(summonButton, summonHovered ? Color{235, 183, 197, 255} : Color{202, 132, 154, 255});
+        DrawRectangleLinesEx(summonButton, 2.0f, Color{92, 45, 58, 255});
+        DrawText("Summon Pig", static_cast<int>(summonButton.x + 18.0f), static_cast<int>(summonButton.y + 8.0f), 18, WHITE);
         drawCrosshair();
         EndDrawing();
     }
 
     for (auto& entry : chunks) unloadMesh(entry.second);
+    UnloadModel(pigModel);
+    UnloadTexture(pigTexture);
     UnloadMaterial(voxelMaterial);
     UnloadTexture(voxelAtlas);
     CloseWindow();
